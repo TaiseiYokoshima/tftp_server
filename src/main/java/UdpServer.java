@@ -38,7 +38,6 @@ public class UdpServer {
         return Arrays.copyOfRange(buffer,0, index);
     }
 
-
     public static byte[] decode_short_to_unsigned_bytes(int num) {
         int unsigned16Bit = num & 0xFFFF;
         byte[] bytes = new byte[2];
@@ -131,16 +130,19 @@ public class UdpServer {
             //1 now there is no available bytes to be read
             //2 the available bytes is less than 512 which means this will be last packet
             // this will provide the last iteration of this loop
-            if (inputStream.available() == 0 || inputStream.available() < 512) {
+
+            int available = inputStream.available();
+            if (available == 0 || available < 512) {
                 System.out.println("hit last packet");
                 stay = false;
             };
 
-            byte[] file_buffer = new byte[512];
-            inputStream.read(file_buffer, 0, 512);
+            int to_read = (stay) ? available : 512;
 
-            // if this is the last packet, the data needs to be truncated
-            if (!stay) file_buffer = truncate_data(file_buffer);
+
+            byte[] file_buffer = new byte[to_read];
+            inputStream.read(file_buffer, 0, to_read);
+            
             DatagramPacket data_packet = this.generate_data_packet(block_num, ip, port, file_buffer);
             session_socket.send(data_packet);
             System.out.println("block " + block_num + " sent");
