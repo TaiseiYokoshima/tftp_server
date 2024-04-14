@@ -142,7 +142,7 @@ public class UdpServer {
 
             byte[] file_buffer = new byte[to_read];
             inputStream.read(file_buffer, 0, to_read);
-            
+
             DatagramPacket data_packet = this.generate_data_packet(block_num, ip, port, file_buffer);
             session_socket.send(data_packet);
             System.out.println("block " + block_num + " sent");
