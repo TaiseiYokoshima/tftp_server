@@ -25,19 +25,6 @@ public class UdpServer {
         return ((packet[first] & 0xFF) << 8) | (packet[second] & 0xFF);
     }
 
-    public static byte[] truncate_data(byte[] buffer) {
-        //finds the index of the data buffer where the data ends
-        int index = 0;
-        for (int i = 0; i < buffer.length; i++) {
-            if (buffer[i] == 0x00) {
-                index = i;
-                break;
-            }
-        }
-        //copies and truncate the data with index
-        return Arrays.copyOfRange(buffer,0, index);
-    }
-
     public static byte[] decode_short_to_unsigned_bytes(int num) {
         int unsigned16Bit = num & 0xFFFF;
         byte[] bytes = new byte[2];
@@ -60,11 +47,8 @@ public class UdpServer {
                     System.err.println(msg +  ".\n You do not have permission to bind to this port: To run, elevate your privilege, choose another port, or randomize it by not providing the argument.");
                     System.exit(1);
                 }
-
-                throw new RuntimeException(e);
-            } else {
-                throw new RuntimeException(e);
             }
+            throw new RuntimeException(e);
         } catch (java.net.SocketException socket_ex) {
             throw new RuntimeException(socket_ex);
         }
@@ -135,7 +119,7 @@ public class UdpServer {
             if (available < 512) {
                 System.out.println("hit last packet");
                 stay = false;
-            };
+            }
 
             int to_read = (stay) ? 512 : available;
 
@@ -184,8 +168,8 @@ public class UdpServer {
         session_socket.close();
     }
 
-    public String get_filepath(byte[] buffer) throws Exception {
-        String filepath = new String(Arrays.copyOfRange(buffer, 2, buffer.length), "US-ASCII").split("\0")[0];
+    public String get_filepath(byte[] buffer) {
+        String filepath = new String(Arrays.copyOfRange(buffer, 2, buffer.length), StandardCharsets.US_ASCII).split("\0")[0];
 
         if (filepath.startsWith("./")) return filepath.stripTrailing();
         if (filepath.startsWith(".\\")) return filepath.stripTrailing();
@@ -196,7 +180,7 @@ public class UdpServer {
         return "./" +  filepath;
     }
 
-    public boolean check_packet_for_ack(DatagramPacket ack_packet, InetAddress ip, int port, int block_num) throws Exception {
+    public boolean check_packet_for_ack(DatagramPacket ack_packet, InetAddress ip, int port, int block_num) {
         byte[] ack_packet_buffer = ack_packet.getData();
         if (!ack_packet.getAddress().equals(ip) || ack_packet.getPort() != port) {
             System.out.println("stranger's packet");
@@ -223,7 +207,7 @@ public class UdpServer {
             return new Object[]{true, count};
         }
         if (decode_code(packet.getData(), true) != block_num) {
-            System.out.println(String.format("wrong block [%d] - packet dropped ", decode_code(packet.getData(), true)));
+            System.out.printf("wrong block [%d] - packet dropped %n", decode_code(packet.getData(), true));
             session_socket.send(last_packet);
             return new Object[]{true, count + 1};
         }
