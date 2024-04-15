@@ -132,16 +132,18 @@ public class UdpServer {
             // this will provide the last iteration of this loop
 
             int available = inputStream.available();
-            if (available == 0 || available < 512) {
+            if (available < 512) {
                 System.out.println("hit last packet");
                 stay = false;
             };
 
-            int to_read = (stay) ? available : 512;
+            int to_read = (stay) ? 512 : available;
 
 
             byte[] file_buffer = new byte[to_read];
-            inputStream.read(file_buffer, 0, to_read);
+            int result = inputStream.read(file_buffer, 0, to_read);
+
+
 
             DatagramPacket data_packet = this.generate_data_packet(block_num, ip, port, file_buffer);
             session_socket.send(data_packet);
