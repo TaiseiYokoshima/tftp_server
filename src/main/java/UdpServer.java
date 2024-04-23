@@ -3,9 +3,13 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Arrays;
+import java.util.Map.Entry;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class UdpServer {
     private final DatagramSocket socket;
+    private static final ConcurrentHashMap<String, Entry<Integer, ReentrantReadWriteLock>> file_map =  new ConcurrentHashMap<>();
 
     public static void main(String[] args) throws Exception {
         UdpServer server;
@@ -20,6 +24,15 @@ public class UdpServer {
         System.out.printf("Accepting connections on %s : %d\n", server.socket.getLocalAddress().toString().substring(1), server.socket.getLocalPort());
         server.start();
     }
+
+    private static boolean validate_write_path(String filepath) {
+        int index = filepath.lastIndexOf('/');
+        if (index < 0) return true;
+        String directory_path = filepath.substring(0, index);
+        File directory = new File(directory_path);
+        return directory.exists() && directory.isDirectory();
+    }
+
 
     public UdpServer(int port) throws IllegalArgumentException, SecurityException {
         try {
@@ -58,11 +71,13 @@ public class UdpServer {
                 switch (code) {
                     case 1:
                         System.out.println("Read initiated from " + ip_str + ":" + port);
-                        this.read(packet, buffer);
+                        Read read_session = new Read(packet, buffer);
+                        read_session.start();
                         break;
                     case 2:
                         System.out.println("Write initiated from " + ip_str + ":" + port);
-                        this.write(packet, buffer);
+                        Write write_session = new Write(packet, buffer);
+                        write_session.start();
                         break;
                 }
             } catch (IOException e) {
@@ -99,7 +114,7 @@ public class UdpServer {
         return bytes;
     }
 
-    private String get_filepath(byte[] buffer) {
+    private static String get_filepath(byte[] buffer) {
         String filepath = new String(Arrays.copyOfRange(buffer, 2, buffer.length), StandardCharsets.US_ASCII).split("\0")[0];
 
         if (filepath.startsWith("./")) return filepath.stripTrailing();
@@ -111,7 +126,7 @@ public class UdpServer {
         return "./" +  filepath;
     }
 
-    private void close_all_streams(String ip, int port, Closeable... resources ) {
+    private static void close_all_streams(String ip, int port, Closeable... resources ) {
         for(Closeable resource : resources) {
             try {
                 resource.close();
@@ -121,81 +136,101 @@ public class UdpServer {
         }
     }
 
+    private static String format_filepath(String filepath) {
+        String output = filepath;
+        output = output.replace('\\', '/');
+        if (output.startsWith("./")) output = output.substring(2);
+        return output;
+    }
 
 
 
 
 
-    private void read(DatagramPacket packet, byte[] buffer) {
-        InetAddress ip = packet.getAddress();
-        String ip_str = ip.toString().substring(1);
-        int port = packet.getPort();
-        String filepath = get_filepath(buffer);
+    public static class Read extends Thread {
+        DatagramPacket packet;
+        byte[] buffer;
+        public Read(DatagramPacket packet, byte[] buffer) {
+            this.packet = packet;
+            this.buffer = buffer;
 
-        File f = new File(filepath);
-        DatagramSocket session_socket;
-        try {
-            session_socket = new DatagramSocket();
-            session_socket.setSoTimeout(100);
-        } catch (IOException e) {
-            System.err.printf("Client Session: %s %d | Could not create session socket and set time out | Terminating session | %s\n", ip_str,  port, e.getMessage());
-            return;
         }
 
-        // error handling, file doesn't exist or filepath is a directory
-        if (!f.exists() || f.isDirectory()) {
-            System.err.printf("Client Session: %s %d | File not found or is a directory | Terminating session\n", ip_str,  port);
-            send_err_packet(session_socket, ip, port);
-            session_socket.close();
-            return;
-        }
+        public void run() {
+            InetAddress ip = packet.getAddress();
+            String ip_str = ip.toString().substring(1);
+            int port = packet.getPort();
+            String filepath = get_filepath(buffer);
+            filepath = format_filepath(filepath);
 
-        //convert file to bytes
-        byte[] file_bytes;
-        try {
-            file_bytes = Files.readAllBytes(f.toPath());
-        } catch (IOException e) {
-            System.err.printf("Client Session: %s %d | Could not load file due to IOException | Terminating session | %s\n", ip_str,  port, e.getMessage());
-            session_socket.close();
-            return;
-        }
-
-
-        System.out.printf("Client Session: %s %d | Sending file: %s ( %d bytes) \n", ip_str,  port, filepath, file_bytes.length);
-
-        //create a stream to read maximum of 512 bytes at a time
-        ByteArrayInputStream inputStream = new ByteArrayInputStream(file_bytes);
-
-        DatagramPacket data_packet;
-
-        int block_num = 1;
-        boolean stay = true;
-        while (stay) {
-
-            Object[] data_sent_check = send_data_packet(session_socket, inputStream, ip, port, block_num);
-            if (data_sent_check == null) {
-                close_all_streams(ip_str, port, session_socket, inputStream);
+            File f = new File(filepath);
+            DatagramSocket session_socket;
+            try {
+                session_socket = new DatagramSocket();
+                session_socket.setSoTimeout(100);
+            } catch (IOException e) {
+                System.err.printf("Client Session: %s %d | Could not create session socket and set time out | Terminating session | %s\n", ip_str, port, e.getMessage());
                 return;
             }
 
-            data_packet = (DatagramPacket) data_sent_check[0];
+            // error handling, file doesn't exist or filepath is a directory
+            if (!f.exists() || f.isDirectory()) {
+                System.err.printf("Client Session: %s %d | Read request denied due to either file being absent or a directory \n", ip_str, port);
+                send_err_packet(session_socket, ip, port, "File not found");
+                session_socket.close();
+                return;
+            }
 
-            stay = (boolean) data_sent_check[1];
 
-            boolean ack_check = accept_ack_packet(session_socket, data_packet, ip, port, block_num);
+            //convert file to bytes
+            byte[] file_bytes;
+            try {
+                file_bytes = Files.readAllBytes(f.toPath());
+            } catch (IOException e) {
+                System.err.printf("Client Session: %s %d | Could not load file due to IOException | Terminating session | %s\n", ip_str, port, e.getMessage());
+                session_socket.close();
+                return;
+            }
 
-            if (ack_check) continue;
 
-            block_num++;
+            System.out.printf("Client Session: %s %d | Sending file: %s ( %d bytes) \n", ip_str, port, filepath, file_bytes.length);
+
+            //create a stream to read maximum of 512 bytes at a time
+            ByteArrayInputStream inputStream = new ByteArrayInputStream(file_bytes);
+
+            DatagramPacket data_packet;
+
+            int block_num = 1;
+            boolean stay = true;
+            while (stay) {
+
+                Object[] data_sent_check = send_data_packet(session_socket, inputStream, ip, port, block_num);
+                if (data_sent_check == null) {
+                    close_all_streams(ip_str, port, session_socket, inputStream);
+                    return;
+                }
+
+                data_packet = (DatagramPacket) data_sent_check[0];
+
+                stay = (boolean) data_sent_check[1];
+
+                boolean ack_check = accept_ack_packet(session_socket, data_packet, ip, port, block_num);
+
+                if (ack_check) continue;
+
+                block_num++;
+            }
+
+            System.out.printf("Client Session: %s %d | Read request completed\n", ip_str, port);
+
+            close_all_streams(ip_str, port, session_socket, inputStream);
+            session_socket.close();
         }
-
-        System.out.printf("Client Session: %s %d | Read request completed\n", ip_str,  port);
-
-        close_all_streams(ip_str, port, session_socket, inputStream);
-        session_socket.close();
     }
 
-    private boolean check_packet_for_ack(DatagramPacket ack_packet, InetAddress ip, int port, int block_num) {
+
+
+    private static boolean check_packet_for_ack(DatagramPacket ack_packet, InetAddress ip, int port, int block_num) {
         String ip_str = ip.toString().substring(1);
         byte[] ack_packet_buffer = ack_packet.getData();
         if (!ack_packet.getAddress().equals(ip) || ack_packet.getPort() != port) {
@@ -213,12 +248,12 @@ public class UdpServer {
         return false;
     }
 
-    private DatagramPacket generate_error_packet(InetAddress ip, int port) {
+    private static DatagramPacket generate_error_packet(InetAddress ip, int port, String message) {
         ByteArrayOutputStream stream = new ByteArrayOutputStream();
         try {
             stream.write(decode_short_to_unsigned_bytes(5));
             stream.write(decode_short_to_unsigned_bytes(1));
-            stream.write("File not found\0".getBytes(StandardCharsets.US_ASCII));
+            stream.write((message + "\0").getBytes(StandardCharsets.US_ASCII));
         } catch (IOException e) {
             System.err.printf("Client Session: %s %d | Could not generate error packet due to IOException | Terminating session | %s\n", ip,  port, e.getMessage());
             return null;
@@ -227,7 +262,7 @@ public class UdpServer {
         return new DatagramPacket(packet_data, packet_data.length, ip, port);
     }
 
-    private DatagramPacket generate_data_packet(int block_num, InetAddress ip, int port, byte[] data) {
+    private static DatagramPacket generate_data_packet(int block_num, InetAddress ip, int port, byte[] data) {
         try {
             ByteArrayOutputStream stream = new ByteArrayOutputStream();
             stream.write(decode_short_to_unsigned_bytes(3));
@@ -241,8 +276,8 @@ public class UdpServer {
         }
     }
 
-    private void send_err_packet(DatagramSocket session_socket, InetAddress ip, int port) {
-        DatagramPacket errorPacket = generate_error_packet(ip, port);
+    private static void send_err_packet(DatagramSocket session_socket, InetAddress ip, int port, String message) {
+        DatagramPacket errorPacket = generate_error_packet(ip, port, message);
         if (errorPacket == null) return;
         try {
             session_socket.send(errorPacket);
@@ -252,7 +287,7 @@ public class UdpServer {
     }
 
     @SuppressWarnings("unused")
-    private Object[] send_data_packet(DatagramSocket session_socket, InputStream inputStream, InetAddress ip, int port, int block_num) {
+    private static Object[] send_data_packet(DatagramSocket session_socket, InputStream inputStream, InetAddress ip, int port, int block_num) {
         String ip_str = ip.toString().substring(1);
         try {
             boolean stay = true;
@@ -269,7 +304,7 @@ public class UdpServer {
 
             byte[] file_buffer = new byte[to_read];
             int result = inputStream.read(file_buffer, 0, to_read);
-            DatagramPacket data_packet = this.generate_data_packet(block_num, ip, port, file_buffer);
+            DatagramPacket data_packet = generate_data_packet(block_num, ip, port, file_buffer);
 
             if (data_packet == null) return null;
 
@@ -283,7 +318,7 @@ public class UdpServer {
         }
     }
 
-    private boolean accept_ack_packet(DatagramSocket session_socket, DatagramPacket data_packet, InetAddress ip, int port, int block_num) {
+    private static boolean accept_ack_packet(DatagramSocket session_socket, DatagramPacket data_packet, InetAddress ip, int port, int block_num) {
         String ip_str = ip.toString().substring(1);
         int count = 0;
         while (true) {
@@ -311,7 +346,7 @@ public class UdpServer {
             }
 
 
-            boolean check_result = this.check_packet_for_ack(ack_packet, ip, port, block_num);
+            boolean check_result = check_packet_for_ack(ack_packet, ip, port, block_num);
 
             if (check_result) continue;
 
@@ -324,98 +359,117 @@ public class UdpServer {
 
 
 
-
-    private void write(DatagramPacket packet, byte[] buffer) {
-        InetAddress ip = packet.getAddress();
-        String ip_str = ip.toString().substring(1);
-        int port = packet.getPort();
-
-        String filepath = get_filepath(buffer);
-        System.out.printf("Client Session: %s %d | Receiving file : %s\n", ip_str,  port, filepath);
-
-        // timeout set high because when writing, we do not transmit data
-        // the client retransmits the packet
-        DatagramSocket session_socket;
-        try {
-            session_socket = new DatagramSocket();
-            session_socket.setSoTimeout(1000);
-        } catch (IOException e) {
-            System.err.printf("Client Session: %s %d | Could not create socket or set time out due to IOException | Terminating session | %s\n", ip_str,  port, e.getMessage());
-            return;
+    public static class Write extends Thread {
+        DatagramPacket packet;
+        byte[] buffer;
+        public Write(DatagramPacket packet, byte[] buffer) {
+            this.packet = packet;
+            this.buffer = buffer;
         }
 
+        public void run() {
+            InetAddress ip = packet.getAddress();
+            String ip_str = ip.toString().substring(1);
+            int port = packet.getPort();
 
-        // zero block ack
-        DatagramPacket ack_packet = this.send_ack_packet(session_socket,0, ip, port);
-        if (ack_packet == null) {
-            session_socket.close();
-            return;
-        }
+            String filepath = get_filepath(buffer);
+            filepath = format_filepath(filepath);
 
 
-        //stream to create file byte[]
-        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+            System.out.printf("Client Session: %s %d | Receiving file : %s\n", ip_str, port, filepath);
 
-        int block_num = 1;
-        boolean stay = true;
-        DatagramPacket data_packet;
-        while (stay) {
+            // timeout set high because when writing, we do not transmit data
+            // the client retransmits the packet
+            DatagramSocket session_socket;
+            try {
+                session_socket = new DatagramSocket();
+                session_socket.setSoTimeout(1000);
+            } catch (IOException e) {
+                System.err.printf("Client Session: %s %d | Could not create socket or set time out due to IOException | Terminating session | %s\n", ip_str, port, e.getMessage());
+                return;
+            }
 
-            data_packet = accept_data_packet(session_socket, ack_packet, ip, port, block_num);
-
-            if (data_packet == null) {
-                close_all_streams(ip_str, port, session_socket, stream);
+            if (!validate_write_path(filepath)) {
+                send_err_packet(session_socket, ip, port,"Directory not found");
+                System.err.printf("Client Session: %s %d | Write request denied due to absent directory in given filepath\n", ip_str, port);
+                session_socket.close();
                 return;
             }
 
 
-            //calculate the length of the data
-            int length = data_packet.getLength() - 4;
 
-            System.out.printf("Client Session: %s %d | Block %d received\n", ip_str,  port, block_num);
-
-
-            // checks to see if this is the last block if so, sets the flag to exit the loop
-            if (length < 512) {
-                System.out.printf("Client Session: %s %d | Hit last block \n", ip_str, port);
-                stay = false;
-            }
-
-
-            //writes the new data to the stream
-            stream.write(data_packet.getData(), 4, length);
-
-            //sends the ack packet
-            ack_packet = this.send_ack_packet(session_socket,block_num, ip, port);
+            // zero block ack
+            DatagramPacket ack_packet = send_ack_packet(session_socket, 0, ip, port);
             if (ack_packet == null) {
-                close_all_streams(ip_str, port, session_socket, stream);
+                session_socket.close();
                 return;
             }
 
 
-            System.out.printf("Client Session: %s %d | Ack %d sent\n", ip_str,  port, block_num);
+            //stream to create file byte[]
+            ByteArrayOutputStream stream = new ByteArrayOutputStream();
 
-            block_num++;
-        }
+            int block_num = 1;
+            boolean stay = true;
+            DatagramPacket data_packet;
+            while (stay) {
 
-        byte[] file_bytes = stream.toByteArray();
+                data_packet = accept_data_packet(session_socket, ack_packet, ip, port, block_num);
 
-        try {
-            FileOutputStream fos = new FileOutputStream(filepath);
-            fos.write(file_bytes);
-            fos.close();
-        } catch (IOException e) {
-            System.err.printf("Client Session: %s %d | Could not save file due to IOException | Terminating session | %s\n", ip_str,  port, e.getMessage());
-            session_socket.close();
+                if (data_packet == null) {
+                    close_all_streams(ip_str, port, session_socket, stream);
+                    return;
+                }
+
+
+                //calculate the length of the data
+                int length = data_packet.getLength() - 4;
+
+                System.out.printf("Client Session: %s %d | Block %d received\n", ip_str, port, block_num);
+
+
+                // checks to see if this is the last block if so, sets the flag to exit the loop
+                if (length < 512) {
+                    System.out.printf("Client Session: %s %d | Hit last block \n", ip_str, port);
+                    stay = false;
+                }
+
+
+                //writes the new data to the stream
+                stream.write(data_packet.getData(), 4, length);
+
+                //sends the ack packet
+                ack_packet = send_ack_packet(session_socket, block_num, ip, port);
+                if (ack_packet == null) {
+                    close_all_streams(ip_str, port, session_socket, stream);
+                    return;
+                }
+
+
+                System.out.printf("Client Session: %s %d | Ack %d sent\n", ip_str, port, block_num);
+
+                block_num++;
+            }
+
+            byte[] file_bytes = stream.toByteArray();
+
+            try {
+                FileOutputStream fos = new FileOutputStream(filepath);
+                fos.write(file_bytes);
+                fos.close();
+            } catch (IOException e) {
+                System.err.printf("Client Session: %s %d | Could not save file due to IOException | Terminating session | %s\n", ip_str, port, e.getMessage());
+                session_socket.close();
+                close_all_streams(ip_str, port, session_socket, stream);
+                return;
+            }
+
+            System.out.printf("Client Session: %s %d | Write request completed | File size : %d bytes\n", ip_str, port, file_bytes.length);
             close_all_streams(ip_str, port, session_socket, stream);
-            return;
         }
-
-        System.out.printf("Client Session: %s %d | Write request completed | File size : %d bytes\n", ip_str,  port, file_bytes.length);
-        close_all_streams(ip_str, port, session_socket, stream);
     }
 
-    private int check_packet_for_data(DatagramSocket session_socket, DatagramPacket packet, DatagramPacket last_packet, InetAddress ip, int port, int block_num) {
+    private static int check_packet_for_data(DatagramSocket session_socket, DatagramPacket packet, DatagramPacket last_packet, InetAddress ip, int port, int block_num) {
         String ip_str = ip.toString().substring(1);
 
         //first check ip and port
@@ -452,7 +506,7 @@ public class UdpServer {
         return 1;
     }
 
-    private DatagramPacket generate_ack_packet(int block_num, InetAddress ip, int port)  {
+    private static DatagramPacket generate_ack_packet(int block_num, InetAddress ip, int port)  {
         String ip_str = ip.toString().substring(1);
         ByteArrayOutputStream stream = new ByteArrayOutputStream();
         try {
@@ -467,9 +521,9 @@ public class UdpServer {
         return new DatagramPacket(packet_data, packet_data.length, ip,port);
     }
 
-    private DatagramPacket send_ack_packet(DatagramSocket session_socket, int block_num, InetAddress ip, int port) {
+    private static DatagramPacket send_ack_packet(DatagramSocket session_socket, int block_num, InetAddress ip, int port) {
         String ip_str = ip.toString().substring(1);
-        DatagramPacket ack = this.generate_ack_packet(block_num, ip, port);
+        DatagramPacket ack = generate_ack_packet(block_num, ip, port);
         if (ack == null) return null;
 
         try {
@@ -482,7 +536,7 @@ public class UdpServer {
         return ack;
     }
 
-    private DatagramPacket accept_data_packet(DatagramSocket session_socket, DatagramPacket ack_packet, InetAddress ip, int port, int block_num) {
+    private static DatagramPacket accept_data_packet(DatagramSocket session_socket, DatagramPacket ack_packet, InetAddress ip, int port, int block_num) {
         String ip_str = ip.toString().substring(1);
         int count = 0;
         while (true){
@@ -507,7 +561,7 @@ public class UdpServer {
             }
 
             //checks the packet to see if it received the right packet
-            int check_result = this.check_packet_for_data(session_socket, data_packet, ack_packet, ip, port, block_num);
+            int check_result = check_packet_for_data(session_socket, data_packet, ack_packet, ip, port, block_num);
 
             switch (check_result) {
                 case -1: return null;
