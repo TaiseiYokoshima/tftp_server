@@ -17,7 +17,7 @@ public class UdpServer {
             server = new UdpServer(port);
         }
 
-        System.out.printf("Accepting connections on %s : %d\n", server.socket.getInetAddress().toString().substring(1), server.socket.getLocalPort());
+        System.out.printf("Accepting connections on %s : %d\n", server.socket.getLocalAddress().toString().substring(1), server.socket.getLocalPort());
         server.start();
     }
 
@@ -111,6 +111,16 @@ public class UdpServer {
         return "./" +  filepath;
     }
 
+    private void close_all_streams(String ip, int port, Closeable... resources ) {
+        for(Closeable resource : resources) {
+            try {
+                resource.close();
+            } catch (IOException e) {
+                System.err.printf("Client Session: %s %d | Could not close resource due to IOException | %s\n", ip,  port, e.getMessage());
+            }
+        }
+    }
+
 
 
 
@@ -164,12 +174,7 @@ public class UdpServer {
 
             Object[] data_sent_check = send_data_packet(session_socket, inputStream, ip, port, block_num);
             if (data_sent_check == null) {
-                session_socket.close();
-                try {
-                    inputStream.close();
-                } catch (IOException e) {
-                    System.err.printf("Client Session: %s %d | Could not close file stream due to IOException | %s\n", ip_str,  port, e.getMessage());
-                }
+                close_all_streams(ip_str, port, session_socket, inputStream);
                 return;
             }
 
@@ -181,17 +186,13 @@ public class UdpServer {
 
             if (ack_check) continue;
 
-        block_num++;
+            block_num++;
         }
 
         System.out.printf("Client Session: %s %d | Read request completed\n", ip_str,  port);
 
+        close_all_streams(ip_str, port, session_socket, inputStream);
         session_socket.close();
-        try {
-            inputStream.close();
-        } catch (IOException e) {
-            System.err.printf("Client Session: %s %d | Could not close file stream due to IOException | %s\n", ip_str,  port, e.getMessage());
-        }
     }
 
     private boolean check_packet_for_ack(DatagramPacket ack_packet, InetAddress ip, int port, int block_num) {
@@ -363,12 +364,7 @@ public class UdpServer {
             data_packet = accept_data_packet(session_socket, ack_packet, ip, port, block_num);
 
             if (data_packet == null) {
-                session_socket.close();
-                try {
-                    stream.close();
-                } catch (IOException e) {
-                    System.err.printf("Client Session: %s %d | Could not close OutputStream due to IOException | %s\n", ip_str,  port, e.getMessage());
-                }
+                close_all_streams(ip_str, port, session_socket, stream);
                 return;
             }
 
@@ -392,12 +388,7 @@ public class UdpServer {
             //sends the ack packet
             ack_packet = this.send_ack_packet(session_socket,block_num, ip, port);
             if (ack_packet == null) {
-                session_socket.close();
-                try {
-                    stream.close();
-                } catch (IOException e) {
-                    System.err.printf("Client Session: %s %d | Could not close OutputStream due to IOException | %s\n", ip_str,  port, e.getMessage());
-                }
+                close_all_streams(ip_str, port, session_socket, stream);
                 return;
             }
 
@@ -416,21 +407,12 @@ public class UdpServer {
         } catch (IOException e) {
             System.err.printf("Client Session: %s %d | Could not save file due to IOException | Terminating session | %s\n", ip_str,  port, e.getMessage());
             session_socket.close();
-            try {
-                stream.close();
-            } catch (IOException ex) {
-                System.err.printf("Client Session: %s %d | Could not close OutputStream due to IOException | %s\n", ip_str,  port, ex.getMessage());
-            }
+            close_all_streams(ip_str, port, session_socket, stream);
             return;
         }
 
         System.out.printf("Client Session: %s %d | Write request completed | File size : %d bytes\n", ip_str,  port, file_bytes.length);
-        session_socket.close();
-        try {
-            stream.close();
-        } catch (IOException e) {
-            System.err.printf("Client Session: %s %d | Could not close OutputStream due to IOException | %s\n", ip_str,  port, e.getMessage());
-        }
+        close_all_streams(ip_str, port, session_socket, stream);
     }
 
     private int check_packet_for_data(DatagramSocket session_socket, DatagramPacket packet, DatagramPacket last_packet, InetAddress ip, int port, int block_num) {
