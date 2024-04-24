@@ -2,14 +2,17 @@ import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.AbstractMap;
 import java.util.Arrays;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class UdpServer {
     private final DatagramSocket socket;
     private static final ConcurrentHashMap<String, Entry<Integer, ReentrantReadWriteLock>> file_map =  new ConcurrentHashMap<>();
+    private static ReentrantLock file_map_lock = new ReentrantLock();
 
     public static void main(String[] args) throws Exception {
         UdpServer server;
@@ -71,12 +74,12 @@ public class UdpServer {
                 switch (code) {
                     case 1:
                         System.out.println("Read initiated from " + ip_str + ":" + port);
-                        Read read_session = new Read(packet, buffer);
+                        Read read_session = new Read(packet, buffer, file_map_lock);
                         read_session.start();
                         break;
                     case 2:
                         System.out.println("Write initiated from " + ip_str + ":" + port);
-                        Write write_session = new Write(packet, buffer);
+                        Write write_session = new Write(packet, buffer, file_map_lock);
                         write_session.start();
                         break;
                 }
@@ -150,10 +153,13 @@ public class UdpServer {
     public static class Read extends Thread {
         DatagramPacket packet;
         byte[] buffer;
-        public Read(DatagramPacket packet, byte[] buffer) {
+        ReentrantLock map_lock;
+        ReentrantReadWriteLock file_lock;
+
+        public Read(DatagramPacket packet, byte[] buffer, ReentrantLock file_map_lock) {
             this.packet = packet;
             this.buffer = buffer;
-
+            this.map_lock = file_map_lock;
         }
 
         public void run() {
@@ -175,21 +181,54 @@ public class UdpServer {
 
             // error handling, file doesn't exist or filepath is a directory
             if (!f.exists() || f.isDirectory()) {
-                System.err.printf("Client Session: %s %d | Read request denied due to either file being absent or a directory \n", ip_str, port);
+                System.err.printf("Client Session: %s %d | Read request denied due to either file being absent or a directory : %s\n", ip_str, port, filepath);
                 send_err_packet(session_socket, ip, port, "File not found");
                 session_socket.close();
                 return;
             }
 
 
-            //convert file to bytes
-            byte[] file_bytes;
+
+
+
+            map_lock.lock();
             try {
-                file_bytes = Files.readAllBytes(f.toPath());
-            } catch (IOException e) {
-                System.err.printf("Client Session: %s %d | Could not load file due to IOException | Terminating session | %s\n", ip_str, port, e.getMessage());
+                Entry<Integer, ReentrantReadWriteLock> entry;
+                if (file_map.containsKey(filepath)) {
+                    entry = file_map.get(filepath);
+                    file_lock = entry.getValue();
+                    entry = new AbstractMap.SimpleImmutableEntry<>(entry.getKey() + 1, file_lock);
+                } else {
+                    file_lock = new ReentrantReadWriteLock();
+                    entry = new AbstractMap.SimpleImmutableEntry<>(1, file_lock);
+                }
+
+                file_map.put(filepath, entry);
+                System.out.printf("Client Session: %s %d | Acquired lock and wrote to file map\n", ip_str, port);
+            } catch (Exception e) {
+                System.err.printf("Client Session: %s %d | Could not acquire lock and write to file map | Terminating session | %s\n", ip_str, port, e.getMessage());
                 session_socket.close();
                 return;
+            } finally {
+                map_lock.unlock();
+            }
+
+
+
+            //convert file to bytes
+            byte[] file_bytes;
+
+
+            file_lock.readLock().lock();
+            try {
+                file_bytes = Files.readAllBytes(f.toPath());
+                System.out.printf("Client Session: %s %d | Acquired file lock and read file\n", ip_str, port);
+            } catch (IOException e) {
+                System.err.printf("Client Session: %s %d | Failed to acquire file lock and read from file | Terminating session | %s\n", ip_str, port, e.getMessage());
+                session_socket.close();
+                return;
+            } finally {
+                file_lock.readLock().unlock();
             }
 
 
@@ -221,10 +260,32 @@ public class UdpServer {
                 block_num++;
             }
 
-            System.out.printf("Client Session: %s %d | Read request completed\n", ip_str, port);
+
 
             close_all_streams(ip_str, port, session_socket, inputStream);
             session_socket.close();
+
+            map_lock.lock();
+            try {
+                Entry<Integer, ReentrantReadWriteLock> entry = file_map.get(filepath);
+                int num_of_access = entry.getKey();
+
+                if (num_of_access < 1) file_map.remove(filepath);
+                else {
+                    entry = new AbstractMap.SimpleImmutableEntry<>(num_of_access - 1, file_lock);
+                    file_map.put(filepath, entry);
+                }
+
+                System.out.printf("Client Session: %s %d | Acquired lock and wrote to file map\n", ip_str, port);
+            } catch (Exception e) {
+                System.err.printf("Client Session: %s %d | Failed to acquire lock and read from file map | %s\n", ip_str, port, e.getMessage());
+                session_socket.close();
+                return;
+            } finally {
+                map_lock.unlock();
+            }
+
+            System.out.printf("Client Session: %s %d | Read request completed\n", ip_str, port);
         }
     }
 
@@ -362,9 +423,12 @@ public class UdpServer {
     public static class Write extends Thread {
         DatagramPacket packet;
         byte[] buffer;
-        public Write(DatagramPacket packet, byte[] buffer) {
+        ReentrantLock map_lock;
+        ReentrantReadWriteLock file_lock;
+        public Write(DatagramPacket packet, byte[] buffer, ReentrantLock file_map_lock) {
             this.packet = packet;
             this.buffer = buffer;
+            this.map_lock = file_map_lock;
         }
 
         public void run() {
@@ -395,6 +459,30 @@ public class UdpServer {
                 session_socket.close();
                 return;
             }
+
+
+            map_lock.lock();
+            try {
+                Entry<Integer, ReentrantReadWriteLock> entry;
+                if (file_map.containsKey(filepath)) {
+                    entry = file_map.get(filepath);
+                    file_lock = entry.getValue();
+                    entry = new AbstractMap.SimpleImmutableEntry<>(entry.getKey() + 1, file_lock);
+                } else {
+                    file_lock = new ReentrantReadWriteLock();
+                    entry = new AbstractMap.SimpleImmutableEntry<>(1, file_lock);
+                }
+
+                file_map.put(filepath, entry);
+                System.out.printf("Client Session: %s %d | Acquired lock and wrote to file map\n", ip_str, port);
+            } catch (Exception e) {
+                System.err.printf("Client Session: %s %d | Could not acquire lock and write to file map | Terminating session | %s\n", ip_str, port, e.getMessage());
+                session_socket.close();
+                return;
+            } finally {
+                map_lock.unlock();
+            }
+
 
 
 
@@ -451,8 +539,13 @@ public class UdpServer {
                 block_num++;
             }
 
+            close_all_streams(ip_str, port, session_socket, stream);
+
             byte[] file_bytes = stream.toByteArray();
 
+
+
+            file_lock.writeLock().lock();
             try {
                 FileOutputStream fos = new FileOutputStream(filepath);
                 fos.write(file_bytes);
@@ -462,10 +555,34 @@ public class UdpServer {
                 session_socket.close();
                 close_all_streams(ip_str, port, session_socket, stream);
                 return;
+            } catch (Exception e) {
+                System.err.printf("Client Session: %s %d | Failed to acquire lock and write to file | %s\n", ip_str, port, e.getMessage());
+            } finally {
+                file_lock.writeLock().unlock();
+            }
+
+
+            map_lock.lock();
+            try {
+                Entry<Integer, ReentrantReadWriteLock> entry = file_map.get(filepath);
+                int num_of_access = entry.getKey();
+
+                if (num_of_access < 1) file_map.remove(filepath);
+                else {
+                    entry = new AbstractMap.SimpleImmutableEntry<>(num_of_access - 1, file_lock);
+                    file_map.put(filepath, entry);
+                }
+
+                System.out.printf("Client Session: %s %d | Acquired lock and wrote to file map\n", ip_str, port);
+            } catch (Exception e) {
+                System.err.printf("Client Session: %s %d | Failed to acquire lock and read from file map | %s\n", ip_str, port, e.getMessage());
+                session_socket.close();
+                return;
+            } finally {
+                map_lock.unlock();
             }
 
             System.out.printf("Client Session: %s %d | Write request completed | File size : %d bytes\n", ip_str, port, file_bytes.length);
-            close_all_streams(ip_str, port, session_socket, stream);
         }
     }
 
