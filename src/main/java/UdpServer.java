@@ -1,19 +1,15 @@
 import java.io.*;
 import java.net.*;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.util.AbstractMap;
 import java.util.Arrays;
-import java.util.Map.Entry;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+
 
 public class UdpServer {
     private final DatagramSocket socket;
-    private static final ConcurrentHashMap<String, Entry<Integer, ReentrantReadWriteLock>> file_map =  new ConcurrentHashMap<>();
-    private static ReentrantLock file_map_lock = new ReentrantLock();
-
     public static void main(String[] args) throws Exception {
         UdpServer server;
         if (args.length == 0) {
@@ -74,12 +70,12 @@ public class UdpServer {
                 switch (code) {
                     case 1:
                         System.out.println("Read initiated from " + ip_str + ":" + port);
-                        Read read_session = new Read(packet, buffer, file_map_lock);
+                        Read read_session = new Read(packet, buffer);
                         read_session.start();
                         break;
                     case 2:
                         System.out.println("Write initiated from " + ip_str + ":" + port);
-                        Write write_session = new Write(packet, buffer, file_map_lock);
+                        Write write_session = new Write(packet, buffer);
                         write_session.start();
                         break;
                 }
@@ -118,15 +114,7 @@ public class UdpServer {
     }
 
     private static String get_filepath(byte[] buffer) {
-        String filepath = new String(Arrays.copyOfRange(buffer, 2, buffer.length), StandardCharsets.US_ASCII).split("\0")[0];
-
-        if (filepath.startsWith("./")) return filepath.stripTrailing();
-        if (filepath.startsWith(".\\")) return filepath.stripTrailing();
-
-        //to do deal with \ in windows
-        //deal with ./
-
-        return "./" +  filepath;
+        return new String(Arrays.copyOfRange(buffer, 2, buffer.length), StandardCharsets.US_ASCII).split("\0")[0];
     }
 
     private static void close_all_streams(String ip, int port, Closeable... resources ) {
@@ -142,7 +130,7 @@ public class UdpServer {
     private static String format_filepath(String filepath) {
         String output = filepath;
         output = output.replace('\\', '/');
-        if (output.startsWith("./")) output = output.substring(2);
+        if (!output.startsWith("./")) output = "./" + output;
         return output;
     }
 
@@ -153,13 +141,10 @@ public class UdpServer {
     public static class Read extends Thread {
         DatagramPacket packet;
         byte[] buffer;
-        ReentrantLock map_lock;
-        ReentrantReadWriteLock file_lock;
 
-        public Read(DatagramPacket packet, byte[] buffer, ReentrantLock file_map_lock) {
+        public Read(DatagramPacket packet, byte[] buffer) {
             this.packet = packet;
             this.buffer = buffer;
-            this.map_lock = file_map_lock;
         }
 
         public void run() {
@@ -181,56 +166,16 @@ public class UdpServer {
 
             // error handling, file doesn't exist or filepath is a directory
             if (!f.exists() || f.isDirectory()) {
-                System.err.printf("Client Session: %s %d | Read request denied due to either file being absent or a directory : %s\n", ip_str, port, filepath);
+                System.err.printf("Client Session: %s %d | Read request denied due to either invalid filepath or filepath is a directory : %s\n", ip_str, port, filepath);
                 send_err_packet(session_socket, ip, port, "File not found");
                 session_socket.close();
                 return;
             }
 
 
-
-
-
-            map_lock.lock();
-            try {
-                Entry<Integer, ReentrantReadWriteLock> entry;
-                if (file_map.containsKey(filepath)) {
-                    entry = file_map.get(filepath);
-                    file_lock = entry.getValue();
-                    entry = new AbstractMap.SimpleImmutableEntry<>(entry.getKey() + 1, file_lock);
-                } else {
-                    file_lock = new ReentrantReadWriteLock();
-                    entry = new AbstractMap.SimpleImmutableEntry<>(1, file_lock);
-                }
-
-                file_map.put(filepath, entry);
-                System.out.printf("Client Session: %s %d | Acquired lock and wrote to file map\n", ip_str, port);
-            } catch (Exception e) {
-                System.err.printf("Client Session: %s %d | Could not acquire lock and write to file map | Terminating session | %s\n", ip_str, port, e.getMessage());
-                session_socket.close();
-                return;
-            } finally {
-                map_lock.unlock();
-            }
-
-
-
             //convert file to bytes
-            byte[] file_bytes;
-
-
-            file_lock.readLock().lock();
-            try {
-                file_bytes = Files.readAllBytes(f.toPath());
-                System.out.printf("Client Session: %s %d | Acquired file lock and read file\n", ip_str, port);
-            } catch (IOException e) {
-                System.err.printf("Client Session: %s %d | Failed to acquire file lock and read from file | Terminating session | %s\n", ip_str, port, e.getMessage());
-                session_socket.close();
-                return;
-            } finally {
-                file_lock.readLock().unlock();
-            }
-
+            byte[] file_bytes = read_file(filepath, ip_str, port);
+            if (file_bytes == null) return;
 
             System.out.printf("Client Session: %s %d | Sending file: %s ( %d bytes) \n", ip_str, port, filepath, file_bytes.length);
 
@@ -243,18 +188,16 @@ public class UdpServer {
             boolean stay = true;
             while (stay) {
 
-                Object[] data_sent_check = send_data_packet(session_socket, inputStream, ip, port, block_num);
-                if (data_sent_check == null) {
+                data_packet = send_data_packet(session_socket, inputStream, ip, port, block_num);
+                if (data_packet == null) {
                     close_all_streams(ip_str, port, session_socket, inputStream);
                     return;
                 }
 
-                data_packet = (DatagramPacket) data_sent_check[0];
+                if (data_packet.getLength() - 4 < 512) stay = false;
 
-                stay = (boolean) data_sent_check[1];
 
                 boolean ack_check = accept_ack_packet(session_socket, data_packet, ip, port, block_num);
-
                 if (ack_check) continue;
 
                 block_num++;
@@ -265,48 +208,18 @@ public class UdpServer {
             close_all_streams(ip_str, port, session_socket, inputStream);
             session_socket.close();
 
-            map_lock.lock();
-            try {
-                Entry<Integer, ReentrantReadWriteLock> entry = file_map.get(filepath);
-                int num_of_access = entry.getKey();
-
-                if (num_of_access < 1) file_map.remove(filepath);
-                else {
-                    entry = new AbstractMap.SimpleImmutableEntry<>(num_of_access - 1, file_lock);
-                    file_map.put(filepath, entry);
-                }
-
-                System.out.printf("Client Session: %s %d | Acquired lock and wrote to file map\n", ip_str, port);
-            } catch (Exception e) {
-                System.err.printf("Client Session: %s %d | Failed to acquire lock and read from file map | %s\n", ip_str, port, e.getMessage());
-                session_socket.close();
-                return;
-            } finally {
-                map_lock.unlock();
-            }
-
             System.out.printf("Client Session: %s %d | Read request completed\n", ip_str, port);
         }
     }
 
-
-
-    private static boolean check_packet_for_ack(DatagramPacket ack_packet, InetAddress ip, int port, int block_num) {
-        String ip_str = ip.toString().substring(1);
-        byte[] ack_packet_buffer = ack_packet.getData();
-        if (!ack_packet.getAddress().equals(ip) || ack_packet.getPort() != port) {
-            System.out.printf("Client Session: %s %d | Ip or port mismatch | Packet dropped\n", ip_str,  port);
-            return true;
+    private static void send_err_packet(DatagramSocket session_socket, InetAddress ip, int port, String message) {
+        DatagramPacket errorPacket = generate_error_packet(ip, port, message);
+        if (errorPacket == null) return;
+        try {
+            session_socket.send(errorPacket);
+        } catch (IOException e) {
+            System.err.printf("Client Session: %s %d | Could not send error packet due to IOException | %s\n", ip,  port, e.getMessage());
         }
-        if (decode_code(ack_packet_buffer, false) != 4) {
-            System.out.printf("Client Session: %s %d | Code mismatch | Packet dropped\n", ip_str,  port);
-            return true;
-        }
-        if (decode_code(ack_packet_buffer, true) != block_num) {
-            System.out.printf("Client Session: %s %d | Block mismatch | Packet dropped\n", ip_str,  port);
-            return true;
-        }
-        return false;
     }
 
     private static DatagramPacket generate_error_packet(InetAddress ip, int port, String message) {
@@ -323,58 +236,25 @@ public class UdpServer {
         return new DatagramPacket(packet_data, packet_data.length, ip, port);
     }
 
-    private static DatagramPacket generate_data_packet(int block_num, InetAddress ip, int port, byte[] data) {
+    private static byte[] read_file(String filepath, String ip_str, int port) {
         try {
-            ByteArrayOutputStream stream = new ByteArrayOutputStream();
-            stream.write(decode_short_to_unsigned_bytes(3));
-            stream.write(decode_short_to_unsigned_bytes(block_num));
-            stream.write(data);
-            byte[] packet_data = stream.toByteArray();
-            return new DatagramPacket(packet_data, packet_data.length, ip, port);
-        } catch (IOException e) {
-            System.err.printf("Client Session: %s %d | Could not generate data packet due to IOException | Terminating session | %s\n", ip.toString().substring(1),  port, e.getMessage());
-            return null;
-        }
-    }
+            RandomAccessFile file = new RandomAccessFile(filepath, "r");
+            FileChannel channel = file.getChannel();
+            FileLock lock = channel.lock(0, Long.MAX_VALUE, true);
+            ByteBuffer buffer = ByteBuffer.allocate((int) channel.size());
 
-    private static void send_err_packet(DatagramSocket session_socket, InetAddress ip, int port, String message) {
-        DatagramPacket errorPacket = generate_error_packet(ip, port, message);
-        if (errorPacket == null) return;
-        try {
-            session_socket.send(errorPacket);
-        } catch (IOException e) {
-            System.err.printf("Client Session: %s %d | Could not send error packet due to IOException | %s\n", ip,  port, e.getMessage());
-        }
-    }
-
-    @SuppressWarnings("unused")
-    private static Object[] send_data_packet(DatagramSocket session_socket, InputStream inputStream, InetAddress ip, int port, int block_num) {
-        String ip_str = ip.toString().substring(1);
-        try {
-            boolean stay = true;
-            int available = inputStream.available();
-
-            System.out.printf("Client Session: %s %d | Available bytes to read: %d \n", ip_str, port, available);
-            if (available < 512) {
-                System.out.printf("Client Session: %s %d | Hit last block \n", ip_str, port);
-                stay = false;
+            while (channel.read(buffer) != -1) {
+                buffer.flip();
             }
 
-            int to_read = (stay) ? 512 : available;
-
-
-            byte[] file_buffer = new byte[to_read];
-            int result = inputStream.read(file_buffer, 0, to_read);
-            DatagramPacket data_packet = generate_data_packet(block_num, ip, port, file_buffer);
-
-            if (data_packet == null) return null;
-
-            session_socket.send(data_packet);
-            System.out.printf("Client Session: %s %d | Block %d sent\n", ip_str, port, block_num);
-
-            return new Object[]{data_packet, stay};
-        } catch (IOException e) {
-            System.err.printf("Client Session: %s %d | Could not send data packet due to IOException | Terminating session | %s\n", ip_str,  port, e.getMessage());
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            lock.release();
+            channel.close();
+            file.close();
+            return bytes;
+        } catch (Exception e) {
+            System.err.printf("Client Session: %s %d | Failed to acquire lock and read file | %s\n", ip_str, port, e.getMessage());
             return null;
         }
     }
@@ -416,6 +296,70 @@ public class UdpServer {
         }
     }
 
+    private static boolean check_packet_for_ack(DatagramPacket ack_packet, InetAddress ip, int port, int block_num) {
+        String ip_str = ip.toString().substring(1);
+        byte[] ack_packet_buffer = ack_packet.getData();
+        if (!ack_packet.getAddress().equals(ip) || ack_packet.getPort() != port) {
+            System.out.printf("Client Session: %s %d | Ip or port mismatch | Packet dropped\n", ip_str,  port);
+            return true;
+        }
+        if (decode_code(ack_packet_buffer, false) != 4) {
+            System.out.printf("Client Session: %s %d | Code mismatch | Packet dropped\n", ip_str,  port);
+            return true;
+        }
+        if (decode_code(ack_packet_buffer, true) != block_num) {
+            System.out.printf("Client Session: %s %d | Block mismatch | Packet dropped\n", ip_str,  port);
+            return true;
+        }
+        return false;
+    }
+
+    @SuppressWarnings("unused")
+    private static DatagramPacket send_data_packet(DatagramSocket session_socket, InputStream inputStream, InetAddress ip, int port, int block_num) {
+        String ip_str = ip.toString().substring(1);
+        try {
+            boolean stay = true;
+            int available = inputStream.available();
+
+            System.out.printf("Client Session: %s %d | Available bytes to read: %d \n", ip_str, port, available);
+            if (available < 512) {
+                System.out.printf("Client Session: %s %d | Hit last block \n", ip_str, port);
+                stay = false;
+            }
+
+            int to_read = (stay) ? 512 : available;
+
+
+            byte[] file_buffer = new byte[to_read];
+            int result = inputStream.read(file_buffer, 0, to_read);
+            DatagramPacket data_packet = generate_data_packet(block_num, ip, port, file_buffer);
+
+            if (data_packet == null) return null;
+
+            session_socket.send(data_packet);
+            System.out.printf("Client Session: %s %d | Block %d sent\n", ip_str, port, block_num);
+
+            return data_packet;
+        } catch (IOException e) {
+            System.err.printf("Client Session: %s %d | Could not send data packet due to IOException | Terminating session | %s\n", ip_str,  port, e.getMessage());
+            return null;
+        }
+    }
+
+    private static DatagramPacket generate_data_packet(int block_num, InetAddress ip, int port, byte[] data) {
+        try {
+            ByteArrayOutputStream stream = new ByteArrayOutputStream();
+            stream.write(decode_short_to_unsigned_bytes(3));
+            stream.write(decode_short_to_unsigned_bytes(block_num));
+            stream.write(data);
+            byte[] packet_data = stream.toByteArray();
+            return new DatagramPacket(packet_data, packet_data.length, ip, port);
+        } catch (IOException e) {
+            System.err.printf("Client Session: %s %d | Could not generate data packet due to IOException | Terminating session | %s\n", ip.toString().substring(1),  port, e.getMessage());
+            return null;
+        }
+    }
+
 
 
 
@@ -423,12 +367,10 @@ public class UdpServer {
     public static class Write extends Thread {
         DatagramPacket packet;
         byte[] buffer;
-        ReentrantLock map_lock;
-        ReentrantReadWriteLock file_lock;
-        public Write(DatagramPacket packet, byte[] buffer, ReentrantLock file_map_lock) {
+
+        public Write(DatagramPacket packet, byte[] buffer) {
             this.packet = packet;
             this.buffer = buffer;
-            this.map_lock = file_map_lock;
         }
 
         public void run() {
@@ -455,35 +397,10 @@ public class UdpServer {
 
             if (!validate_write_path(filepath)) {
                 send_err_packet(session_socket, ip, port,"Directory not found");
-                System.err.printf("Client Session: %s %d | Write request denied due to absent directory in given filepath\n", ip_str, port);
+                System.err.printf("Client Session: %s %d | Write request denied due to absent directory in given filepath : %s\n", ip_str, port, filepath);
                 session_socket.close();
                 return;
             }
-
-
-            map_lock.lock();
-            try {
-                Entry<Integer, ReentrantReadWriteLock> entry;
-                if (file_map.containsKey(filepath)) {
-                    entry = file_map.get(filepath);
-                    file_lock = entry.getValue();
-                    entry = new AbstractMap.SimpleImmutableEntry<>(entry.getKey() + 1, file_lock);
-                } else {
-                    file_lock = new ReentrantReadWriteLock();
-                    entry = new AbstractMap.SimpleImmutableEntry<>(1, file_lock);
-                }
-
-                file_map.put(filepath, entry);
-                System.out.printf("Client Session: %s %d | Acquired lock and wrote to file map\n", ip_str, port);
-            } catch (Exception e) {
-                System.err.printf("Client Session: %s %d | Could not acquire lock and write to file map | Terminating session | %s\n", ip_str, port, e.getMessage());
-                session_socket.close();
-                return;
-            } finally {
-                map_lock.unlock();
-            }
-
-
 
 
             // zero block ack
@@ -538,50 +455,10 @@ public class UdpServer {
 
                 block_num++;
             }
-
+            byte[] file_bytes = stream.toByteArray();
             close_all_streams(ip_str, port, session_socket, stream);
 
-            byte[] file_bytes = stream.toByteArray();
-
-
-
-            file_lock.writeLock().lock();
-            try {
-                FileOutputStream fos = new FileOutputStream(filepath);
-                fos.write(file_bytes);
-                fos.close();
-            } catch (IOException e) {
-                System.err.printf("Client Session: %s %d | Could not save file due to IOException | Terminating session | %s\n", ip_str, port, e.getMessage());
-                session_socket.close();
-                close_all_streams(ip_str, port, session_socket, stream);
-                return;
-            } catch (Exception e) {
-                System.err.printf("Client Session: %s %d | Failed to acquire lock and write to file | %s\n", ip_str, port, e.getMessage());
-            } finally {
-                file_lock.writeLock().unlock();
-            }
-
-
-            map_lock.lock();
-            try {
-                Entry<Integer, ReentrantReadWriteLock> entry = file_map.get(filepath);
-                int num_of_access = entry.getKey();
-
-                if (num_of_access < 1) file_map.remove(filepath);
-                else {
-                    entry = new AbstractMap.SimpleImmutableEntry<>(num_of_access - 1, file_lock);
-                    file_map.put(filepath, entry);
-                }
-
-                System.out.printf("Client Session: %s %d | Acquired lock and wrote to file map\n", ip_str, port);
-            } catch (Exception e) {
-                System.err.printf("Client Session: %s %d | Failed to acquire lock and read from file map | %s\n", ip_str, port, e.getMessage());
-                session_socket.close();
-                return;
-            } finally {
-                map_lock.unlock();
-            }
-
+            write_file(filepath, file_bytes, ip_str, port);
             System.out.printf("Client Session: %s %d | Write request completed | File size : %d bytes\n", ip_str, port, file_bytes.length);
         }
     }
@@ -685,6 +562,20 @@ public class UdpServer {
                 case 1: return data_packet;
                 case 3: count++;
             }
+        }
+    }
+
+    private static void write_file(String filepath, byte[] file_bytes, String ip_str, int port) {
+        try {
+            ByteBuffer buffer = ByteBuffer.wrap(file_bytes);
+            RandomAccessFile file = new RandomAccessFile(filepath, "rw");
+            FileChannel channel = file.getChannel();
+            int result = channel.write(buffer);
+            if (result < file_bytes.length) System.err.printf("Client Session: %s %d | Could not write all data to file\n", ip_str, port);
+            channel.close();
+            file.close();
+        } catch (Exception e) {
+            System.err.printf("Client Session: %s %d | Failed to acquire lock and write file | %s\n", ip_str, port, e.getMessage());
         }
     }
 }
