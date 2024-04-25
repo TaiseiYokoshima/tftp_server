@@ -90,6 +90,9 @@ public class UdpServer {
 
 
     private static int decode_code(byte[] packet, boolean block_num) {
+        //convert bytes which contain 16bit unsigned int to java int
+        //if block_num is false, it decoded 0th, 1st bytes
+        //if true, it decoded 2nd 3rd, used to decode block_num or error code
         int first;
         int second;
 
@@ -106,6 +109,7 @@ public class UdpServer {
     }
 
     private static byte[] decode_short_to_unsigned_bytes(int num) {
+        //method to convert int to bytes and format them as an 16bit unsigned int
         int unsigned16Bit = num & 0xFFFF;
         byte[] bytes = new byte[2];
         bytes[0] = (byte) ((unsigned16Bit >> 8) & 0xFF);
@@ -128,6 +132,7 @@ public class UdpServer {
     }
 
     private static String format_filepath(String filepath) {
+        //method to format filepath so that access is limited to working directory
         String output = filepath;
         output = output.replace('\\', '/');
         if (!output.startsWith("./")) output = "./" + output;
@@ -175,7 +180,10 @@ public class UdpServer {
 
             //convert file to bytes
             byte[] file_bytes = read_file(filepath, ip_str, port);
-            if (file_bytes == null) return;
+            if (file_bytes == null) {
+                close_all_streams(ip_str, port, session_socket);
+                return;
+            }
 
             System.out.printf("Client Session: %s %d | Sending file: %s ( %d bytes) \n", ip_str, port, filepath, file_bytes.length);
 
@@ -193,7 +201,8 @@ public class UdpServer {
                     close_all_streams(ip_str, port, session_socket, inputStream);
                     return;
                 }
-
+                
+                //exit condition, last block
                 if (data_packet.getLength() - 4 < 512) stay = false;
 
 
@@ -237,6 +246,7 @@ public class UdpServer {
     }
 
     private static byte[] read_file(String filepath, String ip_str, int port) {
+        // acquire file lock to prevent parallel read and write
         try {
             RandomAccessFile file = new RandomAccessFile(filepath, "r");
             FileChannel channel = file.getChannel();
