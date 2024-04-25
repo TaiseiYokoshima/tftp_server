@@ -138,7 +138,7 @@ public class UdpServer {
 
 
 
-    public static class Read extends Thread {
+    private static class Read extends Thread {
         DatagramPacket packet;
         byte[] buffer;
 
@@ -364,7 +364,7 @@ public class UdpServer {
 
 
 
-    public static class Write extends Thread {
+    private static class Write extends Thread {
         DatagramPacket packet;
         byte[] buffer;
 
